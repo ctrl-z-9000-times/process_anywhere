@@ -17,6 +17,9 @@ pub enum Error {
 
     #[error("{0}")]
     SSH(#[from] ssh2::Error),
+
+    #[error("{0}")]
+    UTF8(#[from] std::string::FromUtf8Error),
 }
 
 /// Token representing a computer and how to access it.
@@ -193,16 +196,14 @@ impl Computer {
         std::fs::write(path, &data)?;
         Ok(())
     }
-    pub fn exec(
-        self: Arc<Computer>,
-        program: &str,
-        arguments: &[&str],
-    ) -> Result<Box<Process>, Error> {
+    /// Argument command is the program path followed by its arguments.
+    pub fn exec(self: Arc<Computer>, command: &[impl AsRef<str>]) -> Result<Box<Process>, Error> {
+        assert!(!command.is_empty());
         let inner = match self.as_ref() {
             Computer::Local => {
                 // Setup the subprocess command.
-                let mut cmd = Command::new(program);
-                cmd.args(arguments);
+                let mut cmd = Command::new(command[0].as_ref());
+                cmd.args(command[1..].iter().map(|arg| arg.as_ref()));
                 cmd.stdin(Stdio::piped());
                 cmd.stdout(Stdio::piped());
                 cmd.stderr(Stdio::piped());
@@ -222,12 +223,20 @@ impl Computer {
                 ProcessInner::Local(child)
             }
             Computer::Remote { sess, .. } => {
-                let sess = sess.as_ref().unwrap();
+                // Assemble the command into a single line.
+                let mut line = String::with_capacity(
+                    command.iter().map(|arg| arg.as_ref().len()).sum::<usize>() + command.len() - 1,
+                );
+                line.push_str(command[0].as_ref());
+                for arg in &command[1..] {
+                    line.push(' ');
+                    line.push_str(arg.as_ref());
+                }
                 // Run the program on the remote computer.
+                let sess = sess.as_ref().unwrap();
                 sess.set_blocking(true);
                 let mut channel = sess.channel_session()?;
-                let command = assemble_command_line(program, arguments);
-                channel.exec(&command)?;
+                channel.exec(&line)?;
                 sess.set_blocking(false);
                 //
                 ProcessInner::Remote(channel)
@@ -240,18 +249,6 @@ impl Computer {
             inner,
         }))
     }
-}
-
-fn assemble_command_line(program: &str, arguments: &[&str]) -> String {
-    let mut command = String::with_capacity(
-        program.len() + arguments.iter().map(|arg| arg.len()).sum::<usize>() + arguments.len() - 1,
-    );
-    command.push_str(program);
-    for arg in arguments {
-        command.push(' ');
-        command.push_str(arg);
-    }
-    command
 }
 
 fn remote_create_dir_all(sftp: &Sftp, dir: &Path, mode: i32) -> Result<(), Error> {
@@ -400,7 +397,7 @@ impl Process {
         let stdout = self.stdout()?;
         let partial_read = read_nonblocking(stdout)?;
         self.stdout_buffer.extend(&partial_read);
-        Ok(read_line(&mut self.stdout_buffer))
+        Ok(read_line(&mut self.stdout_buffer)?)
     }
     pub fn recv_bytes(&mut self, bytes: usize) -> Result<Option<Box<[u8]>>, Error> {
         let stdout = self.stdout()?;
@@ -418,7 +415,7 @@ impl Process {
             ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr())?,
         };
         self.stderr_buffer.extend(stderr);
-        Ok(read_line(&mut self.stdout_buffer))
+        Ok(read_line(&mut self.stdout_buffer)?)
     }
     pub fn error_bytes(&mut self) -> Result<Vec<u8>, Error> {
         let stderr = match &mut self.inner {
@@ -496,14 +493,15 @@ fn read_nonblocking(pipe: &mut dyn Read) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn read_line(buffer: &mut VecDeque<u8>) -> Option<String> {
+fn read_line(buffer: &mut VecDeque<u8>) -> Result<Option<String>, Error> {
     if let Some(newline) = buffer.iter().position(|&chr| chr == b'\n') {
         let mut tail = buffer.split_off(newline);
-        std::mem::swap(&mut tail, buffer);
-        buffer.pop_front(); // Discard the separating newline character.
-        Some(String::from_utf8(tail.into()).unwrap())
+        tail.pop_front(); // Discard the separating newline character.
+        let line = std::mem::replace(buffer, tail);
+        let line = String::from_utf8(line.into())?; // Consume the line even if it fails to parse.
+        Ok(Some(line))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -533,7 +531,7 @@ mod tests {
     #[test]
     fn local_ack() {
         let comp = dbg!(Arc::new(Computer::Local));
-        let mut proc = dbg!(comp.exec("cat", &["-"])).unwrap();
+        let mut proc = dbg!(comp.exec(&["cat", "-"])).unwrap();
 
         // No data yet, should instantly yield (non-blocking).
         assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
@@ -544,6 +542,22 @@ mod tests {
         assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "Hello localhost");
 
         // Message consumed, no further messages.
+        assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
+
+        assert!(proc.error_bytes().unwrap().is_empty());
+        proc.kill().unwrap();
+    }
+
+    #[test]
+    fn new_lines() {
+        let comp = dbg!(Arc::new(Computer::Local));
+        let mut proc = dbg!(comp.exec(&["cat", "-"])).unwrap();
+        proc.send_line("Hello\n\n \nlocalhost\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "Hello");
+        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "");
+        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), " ");
+        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "localhost");
         assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
 
         assert!(proc.error_bytes().unwrap().is_empty());
@@ -565,7 +579,7 @@ mod tests {
         // First SCP the environment files onto the remote test computer.
         let mut comp = dbg!(test_computer());
         comp.connect().unwrap();
-        let mut proc = dbg!(Arc::new(comp).exec("cat", &["-"])).unwrap();
+        let mut proc = dbg!(Arc::new(comp).exec(&["cat".to_string(), "-".to_string()])).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
