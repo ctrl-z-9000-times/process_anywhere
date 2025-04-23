@@ -415,7 +415,7 @@ impl Process {
             ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr())?,
         };
         self.stderr_buffer.extend(stderr);
-        Ok(read_line(&mut self.stdout_buffer)?)
+        Ok(read_line(&mut self.stderr_buffer)?)
     }
     pub fn error_bytes(&mut self) -> Result<Vec<u8>, Error> {
         let stderr = match &mut self.inner {
@@ -546,6 +546,15 @@ mod tests {
 
         assert!(proc.error_bytes().unwrap().is_empty());
         proc.kill().unwrap();
+    }
+
+    #[test]
+    fn error_line() {
+        let comp = dbg!(Arc::new(Computer::Local));
+        let mut proc = dbg!(comp.exec(&["cat", "foobar"])).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
+        assert!(dbg!(proc.error_line()).unwrap().is_some());
     }
 
     #[test]

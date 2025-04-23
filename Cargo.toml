@@ -1,6 +1,6 @@
 [package]
     name = "process_anywhere"
-    version = "0.2.0"
+    version = "0.2.1"
     edition = "2024"
     license = "MIT-0"
     description = "Tools for running computer processes locally and remotely via SSH."
