@@ -1,4 +1,4 @@
-//! Tools for running computer processes locally and remotely via SSH.
+//! Tools for running computer processes locally or remotely via SSH.
 
 use ssh2::{Channel, Session, Sftp};
 use std::collections::VecDeque;
@@ -28,24 +28,26 @@ pub enum Computer {
     /// Local host computer.
     Local,
 
-    /// Access a remote host computer using the Secure Shell Protocol (SSH).
+    /// Remote host computer via the Secure Shell Protocol (SSH).
     Remote {
         /// Hostname of the remote computer.
         host: String,
         addr: SocketAddr,
         user: String,
         auth: String,
-        /// The computer also contains the established SSH connection object.
+        /// The established SSH connection object.
         /// One SSH session multiplexes to service multiple remote processes.
         sess: Option<Session>,
     },
 }
 
 impl Computer {
-    pub fn localhost() -> Self {
+    /// Get the computer that is currently running this program.
+    pub fn new_local() -> Self {
         Self::Local
     }
-    pub fn remote(host: String, user: String, auth: String) -> Result<Self, Error> {
+    /// Get a computer remotely over SSH.
+    pub fn new_remote(host: String, user: String, auth: String) -> Result<Self, Error> {
         let addr = host.to_socket_addrs()?.next().unwrap();
         Ok(Self::Remote {
             host,
@@ -54,10 +56,6 @@ impl Computer {
             auth,
             sess: None,
         })
-    }
-    /// Returns the externally visible hostname of this computer.
-    pub fn host(&self) -> String {
-        format!("{self}")
     }
     /// Establish an SSH connection to a remote computer.  
     /// This does nothing on local computers.  
@@ -85,7 +83,7 @@ impl Computer {
         }
         Ok(())
     }
-    /// Zeroes the authentication token / password out of memory.
+    /// Zero the authentication token / password out of memory.
     fn delete_auth(&mut self) {
         match self {
             Self::Local => {}
@@ -100,6 +98,10 @@ impl Computer {
                 *auth = String::new(); // Free the memory allocation.
             }
         }
+    }
+    /// Returns the externally visible hostname of this computer.
+    pub fn host(&self) -> String {
+        format!("{self}")
     }
     /// Returns an active session if this is a remote computer, or [None] if
     /// this is a local computer.  
@@ -261,7 +263,7 @@ fn remote_create_dir_all(sftp: &Sftp, dir: &Path, mode: i32) -> Result<(), Error
             // ErrorCode #2 is "file not found" error.
             ssh2::ErrorCode::SFTP(2) => {
                 if let Some(parent) = dir.parent() {
-                    // Recusively ensure that the parent directory exists.
+                    // Recursively ensure that the parent directory exists.
                     remote_create_dir_all(sftp, parent, mode)?;
                     // Make the target directory.
                     sftp.mkdir(dir, mode)?;
@@ -327,10 +329,13 @@ impl Drop for Computer {
     }
 }
 
-/// Container for a running instance of the environment.  
+/// Container for an active computer process.  
 ///
-/// Provides a common interface for interacting with an environment's computer
-/// process, regardless of which computer it is running on.
+/// This provides an API for interacting with computer processes,
+/// regardless of where the computer is located.
+///
+/// Drop only closes the process's standard input channel.
+/// This does not wait for or kill processes when dropped.
 #[derive(Debug)]
 pub struct Process {
     computer: Arc<Computer>,
@@ -357,6 +362,65 @@ impl fmt::Debug for ProcessInner {
 }
 
 impl Process {
+    /// Is this process still running or does it have unread messages on stdout or stderr?
+    pub fn is_alive(&mut self) -> Result<bool, Error> {
+        dbg!(&self);
+        let Self {
+            inner,
+            stdout_buffer,
+            stderr_buffer,
+            ..
+        } = self;
+        match inner {
+            ProcessInner::Local(child) => {
+                // Check for buffered & uncollected data.
+                if !stdout_buffer.is_empty() || !stderr_buffer.is_empty() {
+                    return Ok(true);
+                }
+                // Check for normal exit status code.
+                let status = child.try_wait()?;
+                if status.is_none() {
+                    return Ok(true);
+                }
+                // Final check for unread messages.
+                let stdout_pipe = child
+                    .stdout
+                    .as_mut()
+                    .ok_or(Error::Io(ErrorKind::BrokenPipe.into()))?;
+                match read_nonblocking(stdout_pipe) {
+                    Ok(stdout_data) => {
+                        stdout_buffer.append(&mut stdout_data.into());
+                        return Ok(true);
+                    }
+                    Err(err) => {
+                        // Ignore EOF errors.
+                        if err.kind() != ErrorKind::BrokenPipe {
+                            return Err(err.into());
+                        }
+                    }
+                }
+                let stderr_pipe = child
+                    .stderr
+                    .as_mut()
+                    .ok_or(Error::Io(ErrorKind::BrokenPipe.into()))?;
+                match read_nonblocking(stderr_pipe) {
+                    Ok(stderr_data) => {
+                        stderr_buffer.append(&mut stderr_data.into());
+                        return Ok(true);
+                    }
+                    Err(err) => {
+                        // Ignore EOF errors.
+                        if err.kind() != ErrorKind::BrokenPipe {
+                            return Err(err.into());
+                        }
+                    }
+                }
+                //
+                Ok(false)
+            }
+            ProcessInner::Remote(channel) => Ok(!channel.eof()),
+        }
+    }
     /// Get the computer that this process is running on.
     pub fn computer(&self) -> &Arc<Computer> {
         &self.computer
@@ -496,30 +560,57 @@ impl Process {
     pub fn close_stdin(&mut self) -> Result<(), Error> {
         match &mut self.inner {
             ProcessInner::Local(child) => {
-                child.stdin.take();
+                if let Some(mut pipe) = child.stdin.take() {
+                    pipe.flush()?;
+                }
             }
             ProcessInner::Remote(channel) => {
-                channel.close()?;
-            }
-        }
-        Ok(())
-    }
-    /// Force kill the process and block until it terminates.
-    pub fn kill(&mut self) -> Result<(), Error> {
-        self.close_stdin()?;
-        match &mut self.inner {
-            ProcessInner::Local(child) => {
-                child.kill()?;
-                child.wait()?;
-            }
-            ProcessInner::Remote(channel) => {
+                // Block so that it can flush the buffer.
                 let sess = self.computer.get_session().unwrap();
                 sess.set_blocking(true);
-                channel.wait_close()?;
+                channel.close()?;
                 sess.set_blocking(false);
             }
         }
         Ok(())
+    }
+    /// Close the process's standard input channel and block until it terminates.
+    ///
+    /// Returns [true] if the process ended cleanly, or [false] if killed by a
+    /// signal or if it exited with non-zero status code.
+    pub fn wait(&mut self) -> Result<bool, Error> {
+        match &mut self.inner {
+            ProcessInner::Local(child) => {
+                if let Some(mut pipe) = child.stdin.take() {
+                    pipe.flush()?;
+                }
+                let status = child.wait()?;
+                Ok(status.success())
+            }
+            ProcessInner::Remote(channel) => {
+                //
+                let sess = self.computer.get_session().unwrap();
+                sess.set_blocking(true);
+                channel.close()?;
+                channel.wait_close()?;
+                sess.set_blocking(false);
+                //
+                let signal = channel.exit_signal()?;
+                if signal.exit_signal.is_some() {
+                    return Ok(false);
+                }
+                //
+                let status = channel.exit_status()?;
+                let success = status == 0;
+                return Ok(success);
+            }
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _error = self.close_stdin();
     }
 }
 
@@ -619,6 +710,7 @@ mod tests {
     fn local_ack() {
         let comp = dbg!(Arc::new(Computer::Local));
         let mut proc = dbg!(comp.exec(&["cat", "-"])).unwrap();
+        assert!(proc.is_alive().unwrap());
 
         // No data yet, should instantly yield (non-blocking).
         assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
@@ -632,7 +724,9 @@ mod tests {
         assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
 
         assert!(proc.error_bytes().unwrap().is_empty());
-        proc.kill().unwrap();
+        assert!(proc.wait().unwrap());
+
+        assert!(!proc.is_alive().unwrap());
     }
 
     #[test]
@@ -640,8 +734,11 @@ mod tests {
         let comp = dbg!(Arc::new(Computer::Local));
         let mut proc = dbg!(comp.exec(&["cat", "foobar"])).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(proc.is_alive().unwrap());
         assert!(proc.recv_line().is_err());
         assert!(dbg!(proc.error_line()).unwrap().is_some());
+        assert!(!proc.wait().unwrap());
+        assert!(!proc.is_alive().unwrap());
     }
 
     #[test]
@@ -657,7 +754,7 @@ mod tests {
         assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
 
         assert!(proc.error_bytes().unwrap().is_empty());
-        proc.kill().unwrap();
+        assert!(proc.wait().unwrap());
     }
 
     #[test]
@@ -672,7 +769,7 @@ mod tests {
         assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "three");
         assert!(dbg!(proc.recv_line()).is_err());
 
-        proc.kill().unwrap();
+        assert!(proc.wait().unwrap());
     }
 
     fn test_computer() -> Computer {
@@ -691,6 +788,7 @@ mod tests {
         let mut comp = dbg!(test_computer());
         comp.connect().unwrap();
         let mut proc = dbg!(Arc::new(comp).exec(&["cat".to_string(), "-".to_string()])).unwrap();
+        assert!(proc.is_alive().unwrap());
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -706,7 +804,8 @@ mod tests {
         assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
 
         assert!(proc.error_bytes().unwrap().is_empty());
-        proc.kill().unwrap();
+        assert!(proc.wait().unwrap());
+        assert!(!proc.is_alive().unwrap());
     }
 
     /// Test sending and receiving files.

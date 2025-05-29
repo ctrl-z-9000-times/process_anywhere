@@ -3,7 +3,7 @@
     version = "0.2.1"
     edition = "2024"
     license = "MIT-0"
-    description = "Tools for running computer processes locally and remotely via SSH."
+    description = "Tools for running computer processes locally or remotely via SSH."
     repository = "https://github.com/ctrl-z-9000-times/process_anywhere"
     authors = ["David McDougall <dam1784@rit.edu>"]
     keywords = ["subprocess", "SSH"]
