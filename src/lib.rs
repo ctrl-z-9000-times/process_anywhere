@@ -25,10 +25,10 @@ pub enum Error {
 /// Token representing a computer and how to access it.
 #[derive(Clone)]
 pub enum Computer {
-    /// Localhost
+    /// Local host computer.
     Local,
 
-    /// Access a remote computer using the Secure Shell Protocol (SSH).
+    /// Access a remote host computer using the Secure Shell Protocol (SSH).
     Remote {
         /// Hostname of the remote computer.
         host: String,
@@ -357,6 +357,7 @@ impl fmt::Debug for ProcessInner {
 }
 
 impl Process {
+    /// Get the computer that this process is running on.
     pub fn computer(&self) -> &Arc<Computer> {
         &self.computer
     }
@@ -378,6 +379,8 @@ impl Process {
             ProcessInner::Remote(channel) => channel,
         })
     }
+    /// Write to and flush the process's standard input channel.
+    /// This appends a newline (if not already present).
     pub fn send_line(&mut self, message: &str) -> Result<(), Error> {
         let stdin = self.stdin()?;
         stdin.write_all(message.as_bytes())?;
@@ -387,46 +390,123 @@ impl Process {
         stdin.flush()?;
         Ok(())
     }
+    /// Write to and flush the process's standard input channel.
     pub fn send_bytes(&mut self, message: &[u8]) -> Result<(), Error> {
         let stdin = self.stdin()?;
         stdin.write_all(message)?;
         stdin.flush()?;
         Ok(())
     }
+    /// Read zero or one lines from the process's standard output channel.
     pub fn recv_line(&mut self) -> Result<Option<String>, Error> {
+        // First check the local buffer.
+        let line = read_line(&mut self.stdout_buffer)?;
+        if line.is_some() {
+            return Ok(line);
+        }
+        //
         let stdout = self.stdout()?;
-        let partial_read = read_nonblocking(stdout)?;
-        self.stdout_buffer.extend(&partial_read);
-        Ok(read_line(&mut self.stdout_buffer)?)
+        let read_result = read_nonblocking(stdout);
+        //
+        match read_result {
+            Ok(data) => {
+                self.stdout_buffer.append(&mut data.into());
+                let line = read_line(&mut self.stdout_buffer)?;
+                return Ok(line);
+            }
+            Err(err) => {
+                let eof = err.kind() == ErrorKind::BrokenPipe;
+                if eof && !self.stdout_buffer.is_empty() {
+                    let data = std::mem::take(&mut self.stdout_buffer);
+                    let line = Some(String::from_utf8(data.into())?);
+                    return Ok(line);
+                }
+                return Err(err.into());
+            }
+        }
     }
+    /// Read zero or one lines from the process's standard error channel.
+    pub fn error_line(&mut self) -> Result<Option<String>, Error> {
+        // First check the local buffer.
+        let line = read_line(&mut self.stderr_buffer)?;
+        if line.is_some() {
+            return Ok(line);
+        }
+        //
+        let read_result = match &mut self.inner {
+            ProcessInner::Local(child) => read_nonblocking(child.stderr.as_mut().unwrap()),
+            ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr()),
+        };
+        //
+        match read_result {
+            Ok(data) => {
+                self.stderr_buffer.append(&mut data.into());
+                let line = read_line(&mut self.stderr_buffer)?;
+                return Ok(line);
+            }
+            Err(err) => {
+                let eof = err.kind() == ErrorKind::BrokenPipe;
+                if eof && !self.stderr_buffer.is_empty() {
+                    let data = std::mem::take(&mut self.stderr_buffer);
+                    let line = Some(String::from_utf8(data.into())?);
+                    return Ok(line);
+                }
+                return Err(err.into());
+            }
+        }
+    }
+    /// Read an exact number of bytes from the process's standard output channel.
     pub fn recv_bytes(&mut self, bytes: usize) -> Result<Option<Box<[u8]>>, Error> {
+        // First check the local buffer.
+        if self.stdout_buffer.len() >= bytes {
+            return Ok(Some(self.stdout_buffer.drain(..bytes).collect()));
+        }
+        //
         let stdout = self.stdout()?;
-        let partial_read = read_nonblocking(stdout)?;
-        self.stdout_buffer.extend(&partial_read);
+        let chunk = read_nonblocking(stdout)?;
+        self.stdout_buffer.append(&mut chunk.into());
         if self.stdout_buffer.len() >= bytes {
             Ok(Some(self.stdout_buffer.drain(..bytes).collect()))
         } else {
             Ok(None)
         }
     }
-    pub fn error_line(&mut self) -> Result<Option<String>, Error> {
-        let stderr = match &mut self.inner {
-            ProcessInner::Local(child) => read_nonblocking(child.stderr.as_mut().unwrap())?,
-            ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr())?,
-        };
-        self.stderr_buffer.extend(stderr);
-        Ok(read_line(&mut self.stderr_buffer)?)
-    }
+    /// Read all available bytes from the process's standard error channel.
     pub fn error_bytes(&mut self) -> Result<Vec<u8>, Error> {
-        let stderr = match &mut self.inner {
-            ProcessInner::Local(child) => read_nonblocking(child.stderr.as_mut().unwrap())?,
-            ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr())?,
+        let read_result = match &mut self.inner {
+            ProcessInner::Local(child) => read_nonblocking(child.stderr.as_mut().unwrap()),
+            ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr()),
         };
-        self.stderr_buffer.extend(stderr);
-        Ok(self.stderr_buffer.drain(..).collect())
+        match read_result {
+            Ok(data) => {
+                self.stderr_buffer.append(&mut data.into());
+                Ok(self.stderr_buffer.drain(..).collect())
+            }
+            Err(err) => {
+                let eof = err.kind() == ErrorKind::BrokenPipe;
+                if eof && !self.stderr_buffer.is_empty() {
+                    let data = std::mem::take(&mut self.stderr_buffer);
+                    return Ok(data.into());
+                }
+                return Err(err.into());
+            }
+        }
+    }
+    /// Close the process's standard input channel.
+    pub fn close_stdin(&mut self) -> Result<(), Error> {
+        match &mut self.inner {
+            ProcessInner::Local(child) => {
+                child.stdin.take();
+            }
+            ProcessInner::Remote(channel) => {
+                channel.close()?;
+            }
+        }
+        Ok(())
     }
     /// Force kill the process and block until it terminates.
     pub fn kill(&mut self) -> Result<(), Error> {
+        self.close_stdin()?;
         match &mut self.inner {
             ProcessInner::Local(child) => {
                 child.kill()?;
@@ -435,7 +515,6 @@ impl Process {
             ProcessInner::Remote(channel) => {
                 let sess = self.computer.get_session().unwrap();
                 sess.set_blocking(true);
-                channel.close()?;
                 channel.wait_close()?;
                 sess.set_blocking(false);
             }
@@ -470,26 +549,32 @@ fn read_nonblocking(pipe: &mut dyn Read) -> std::io::Result<Vec<u8>> {
     let mut len = 0;
     let mut buffer = vec![];
     loop {
-        buffer.reserve(1);
+        buffer.reserve(100);
         unsafe {
             buffer.set_len(buffer.capacity());
         }
         match pipe.read(&mut buffer[len..]) {
             Ok(num) => {
                 len += num;
-                if len < buffer.len() {
-                    unsafe { buffer.set_len(len) };
+                if len == 0 {
+                    return Err(ErrorKind::BrokenPipe.into());
+                } else if len < buffer.len() {
+                    unsafe {
+                        buffer.set_len(len);
+                    }
                     return Ok(buffer);
                 }
             }
             Err(err) => {
-                return match err.kind() {
+                match err.kind() {
                     ErrorKind::WouldBlock => {
                         unsafe { buffer.set_len(len) };
-                        Ok(buffer)
+                        return Ok(buffer);
                     }
-                    _ => Err(err),
-                }
+                    _ => {
+                        return Err(err);
+                    }
+                };
             }
         }
     }
@@ -555,7 +640,7 @@ mod tests {
         let comp = dbg!(Arc::new(Computer::Local));
         let mut proc = dbg!(comp.exec(&["cat", "foobar"])).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
+        assert!(proc.recv_line().is_err());
         assert!(dbg!(proc.error_line()).unwrap().is_some());
     }
 
@@ -572,6 +657,21 @@ mod tests {
         assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
 
         assert!(proc.error_bytes().unwrap().is_empty());
+        proc.kill().unwrap();
+    }
+
+    #[test]
+    fn eof_line() {
+        let comp = dbg!(Arc::new(Computer::Local));
+        let mut proc = dbg!(comp.exec(&["cat", "-"])).unwrap();
+        proc.send_bytes(b"one\ntwo\nthree").unwrap();
+        proc.close_stdin().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "one");
+        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "two");
+        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "three");
+        assert!(dbg!(proc.recv_line()).is_err());
+
         proc.kill().unwrap();
     }
 
