@@ -13,13 +13,13 @@ use std::sync::Arc;
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("{0}")]
-    IO(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("{0}")]
-    SSH(#[from] ssh2::Error),
+    Ssh(#[from] ssh2::Error),
 
     #[error("{0}")]
-    UTF8(#[from] std::string::FromUtf8Error),
+    Utf8(#[from] std::string::FromUtf8Error),
 }
 
 /// Token representing a computer and how to access it.
@@ -365,7 +365,7 @@ impl Process {
             ProcessInner::Local(child) => child
                 .stdin
                 .as_mut()
-                .ok_or(Error::IO(ErrorKind::BrokenPipe.into()))?,
+                .ok_or(Error::Io(ErrorKind::BrokenPipe.into()))?,
             ProcessInner::Remote(channel) => channel,
         })
     }
@@ -374,7 +374,7 @@ impl Process {
             ProcessInner::Local(child) => child
                 .stdout
                 .as_mut()
-                .ok_or(Error::IO(ErrorKind::BrokenPipe.into()))?,
+                .ok_or(Error::Io(ErrorKind::BrokenPipe.into()))?,
             ProcessInner::Remote(channel) => channel,
         })
     }
@@ -471,7 +471,9 @@ fn read_nonblocking(pipe: &mut dyn Read) -> std::io::Result<Vec<u8>> {
     let mut buffer = vec![];
     loop {
         buffer.reserve(1);
-        unsafe { buffer.set_len(buffer.capacity()) };
+        unsafe {
+            buffer.set_len(buffer.capacity());
+        }
         match pipe.read(&mut buffer[len..]) {
             Ok(num) => {
                 len += num;
