@@ -334,7 +334,7 @@ impl Drop for Computer {
 /// This provides an API for interacting with computer processes,
 /// regardless of where the computer is located.
 ///
-/// Drop only closes the process's standard input channel.
+/// Drop only closes the process’s standard input channel.
 /// This does not wait for or kill processes when dropped.
 #[derive(Debug)]
 pub struct Process {
@@ -443,7 +443,7 @@ impl Process {
             ProcessInner::Remote(channel) => channel,
         })
     }
-    /// Write to and flush the process's standard input channel.
+    /// Write to and flush the process’s standard input channel.
     /// This appends a newline (if not already present).
     pub fn send_line(&mut self, message: &str) -> Result<(), Error> {
         let stdin = self.stdin()?;
@@ -454,14 +454,16 @@ impl Process {
         stdin.flush()?;
         Ok(())
     }
-    /// Write to and flush the process's standard input channel.
+    /// Write to and flush the process’s standard input channel.
     pub fn send_bytes(&mut self, message: &[u8]) -> Result<(), Error> {
         let stdin = self.stdin()?;
         stdin.write_all(message)?;
         stdin.flush()?;
         Ok(())
     }
-    /// Read zero or one lines from the process's standard output channel.
+    /// Read zero or one lines from the process’s standard output channel,
+    /// returning [None] if a line is not yet available. This removes the
+    /// trailing newline.
     pub fn recv_line(&mut self) -> Result<Option<String>, Error> {
         // First check the local buffer.
         let line = read_line(&mut self.stdout_buffer)?;
@@ -476,7 +478,7 @@ impl Process {
             Ok(data) => {
                 self.stdout_buffer.append(&mut data.into());
                 let line = read_line(&mut self.stdout_buffer)?;
-                return Ok(line);
+                Ok(line)
             }
             Err(err) => {
                 let eof = err.kind() == ErrorKind::BrokenPipe;
@@ -485,11 +487,50 @@ impl Process {
                     let line = Some(String::from_utf8(data.into())?);
                     return Ok(line);
                 }
-                return Err(err.into());
+                Err(err.into())
             }
         }
     }
-    /// Read zero or one lines from the process's standard error channel.
+    /// Read an exact number of bytes from the process’s standard output channel,
+    /// or returns [None] if the data is not yet available.
+    pub fn recv_bytes(&mut self, bytes: usize) -> Result<Option<Box<[u8]>>, Error> {
+        // First check the local buffer.
+        if self.stdout_buffer.len() >= bytes {
+            return Ok(Some(self.stdout_buffer.drain(..bytes).collect()));
+        }
+        //
+        let stdout = self.stdout()?;
+        let chunk = read_nonblocking(stdout)?;
+        self.stdout_buffer.append(&mut chunk.into());
+        if self.stdout_buffer.len() >= bytes {
+            Ok(Some(self.stdout_buffer.drain(..bytes).collect()))
+        } else {
+            Ok(None)
+        }
+    }
+    /// Read one line from the process’s standard output channel, blocking until
+    /// it arrives. This removes the trailing newline.
+    pub fn block_line(&mut self) -> Result<String, Error> {
+        loop {
+            if let Some(data) = self.recv_line()? {
+                return Ok(data);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+    /// Read an exact number of bytes from the process’s standard output
+    /// channel, blocking until the data arrives.
+    pub fn block_bytes(&mut self, bytes: usize) -> Result<Box<[u8]>, Error> {
+        loop {
+            if let Some(data) = self.recv_bytes(bytes)? {
+                return Ok(data);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+    /// Read one line from the process’s standard error channel.
     pub fn error_line(&mut self) -> Result<Option<String>, Error> {
         // First check the local buffer.
         let line = read_line(&mut self.stderr_buffer)?;
@@ -506,7 +547,7 @@ impl Process {
             Ok(data) => {
                 self.stderr_buffer.append(&mut data.into());
                 let line = read_line(&mut self.stderr_buffer)?;
-                return Ok(line);
+                Ok(line)
             }
             Err(err) => {
                 let eof = err.kind() == ErrorKind::BrokenPipe;
@@ -515,27 +556,11 @@ impl Process {
                     let line = Some(String::from_utf8(data.into())?);
                     return Ok(line);
                 }
-                return Err(err.into());
+                Err(err.into())
             }
         }
     }
-    /// Read an exact number of bytes from the process's standard output channel.
-    pub fn recv_bytes(&mut self, bytes: usize) -> Result<Option<Box<[u8]>>, Error> {
-        // First check the local buffer.
-        if self.stdout_buffer.len() >= bytes {
-            return Ok(Some(self.stdout_buffer.drain(..bytes).collect()));
-        }
-        //
-        let stdout = self.stdout()?;
-        let chunk = read_nonblocking(stdout)?;
-        self.stdout_buffer.append(&mut chunk.into());
-        if self.stdout_buffer.len() >= bytes {
-            Ok(Some(self.stdout_buffer.drain(..bytes).collect()))
-        } else {
-            Ok(None)
-        }
-    }
-    /// Read all available bytes from the process's standard error channel.
+    /// Read all available bytes from the process’s standard error channel.
     pub fn error_bytes(&mut self) -> Result<Vec<u8>, Error> {
         let read_result = match &mut self.inner {
             ProcessInner::Local(child) => read_nonblocking(child.stderr.as_mut().unwrap()),
@@ -552,11 +577,11 @@ impl Process {
                     let data = std::mem::take(&mut self.stderr_buffer);
                     return Ok(data.into());
                 }
-                return Err(err.into());
+                Err(err.into())
             }
         }
     }
-    /// Close the process's standard input channel.
+    /// Close the process’s standard input channel.
     pub fn close_stdin(&mut self) -> Result<(), Error> {
         match &mut self.inner {
             ProcessInner::Local(child) => {
@@ -574,10 +599,10 @@ impl Process {
         }
         Ok(())
     }
-    /// Close the process's standard input channel and block until it terminates.
+    /// Close the process’s standard input channel and block until it terminates.
     ///
-    /// Returns [true] if the process ended cleanly, or [false] if killed by a
-    /// signal or if it exited with non-zero status code.
+    /// Returns [true] if the process ended cleanly, or [false] if it was killed
+    /// by a signal or if it exited with non-zero status code.
     pub fn wait(&mut self) -> Result<bool, Error> {
         match &mut self.inner {
             ProcessInner::Local(child) => {
@@ -602,7 +627,7 @@ impl Process {
                 //
                 let status = channel.exit_status()?;
                 let success = status == 0;
-                return Ok(success);
+                Ok(success)
             }
         }
     }
@@ -839,5 +864,21 @@ mod tests {
 
         // Check the contents are correct.
         assert_eq!(file_data, roundtrip);
+    }
+
+    #[test]
+    fn blocking() {
+        const PROG: &str = "import time; time.sleep(.2); print('hello', flush=True); import sys; sys.stdout.buffer.write(b'world!'); 1/0";
+        let mut proc = Arc::new(Computer::Local)
+            .exec(&["python", "-c", PROG])
+            .unwrap();
+        assert!(dbg!(proc.error_bytes()).unwrap().is_empty());
+        assert!(dbg!(proc.recv_line().unwrap()).is_none());
+        assert!(dbg!(proc.recv_bytes(6).unwrap()).is_none());
+        //
+        assert_eq!(proc.block_line().unwrap(), "hello");
+        assert_eq!(proc.block_bytes(6).unwrap(), (*b"world!").into());
+        assert!(!dbg!(proc.error_bytes()).unwrap().is_empty()); // div zero error
+        assert!(!proc.wait().unwrap()); // error code at exit
     }
 }
