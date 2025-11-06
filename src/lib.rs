@@ -78,9 +78,9 @@ impl Computer {
             conn.set_tcp_stream(tcp);
             conn.handshake()?;
             conn.userauth_password(user, auth)?;
-            conn.set_blocking(false);
             *sess = Some(conn);
         }
+        self.delete_auth();
         Ok(())
     }
     /// Zero the authentication token / password out of memory.
@@ -104,8 +104,9 @@ impl Computer {
         format!("{self}")
     }
     /// Returns an active session if this is a remote computer, or [None] if
-    /// this is a local computer.  
-    /// Panics if the session has not yet been established.  
+    /// this is the local computer.
+    ///
+    /// Panics if the session has not yet been established.
     fn get_session(&self) -> Option<&Session> {
         if let Self::Remote { sess, .. } = self {
             Some(sess.as_ref().expect("Session not established"))
@@ -200,56 +201,7 @@ impl Computer {
     }
     /// Argument command is the program path followed by its arguments.
     pub fn exec(self: Arc<Computer>, command: &[impl AsRef<str>]) -> Result<Box<Process>, Error> {
-        assert!(!command.is_empty());
-        let inner = match self.as_ref() {
-            Computer::Local => {
-                // Setup the subprocess command.
-                let mut cmd = Command::new(command[0].as_ref());
-                cmd.args(command[1..].iter().map(|arg| arg.as_ref()));
-                cmd.stdin(Stdio::piped());
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::piped());
-                // Spawn the child process.
-                let child = cmd.spawn()?;
-                // Set to non-blocking mode.
-                #[cfg(target_family = "unix")]
-                {
-                    change_blocking_fd(child.stdout.as_ref().unwrap().as_raw_fd(), false);
-                    change_blocking_fd(child.stderr.as_ref().unwrap().as_raw_fd(), false);
-                }
-                #[cfg(target_family = "windows")]
-                {
-                    todo!()
-                }
-                //
-                ProcessInner::Local(child)
-            }
-            Computer::Remote { sess, .. } => {
-                // Assemble the command into a single line.
-                let mut line = String::with_capacity(
-                    command.iter().map(|arg| arg.as_ref().len()).sum::<usize>() + command.len() - 1,
-                );
-                line.push_str(command[0].as_ref());
-                for arg in &command[1..] {
-                    line.push(' ');
-                    line.push_str(arg.as_ref());
-                }
-                // Run the program on the remote computer.
-                let sess = sess.as_ref().unwrap();
-                sess.set_blocking(true);
-                let mut channel = sess.channel_session()?;
-                channel.exec(&line)?;
-                sess.set_blocking(false);
-                //
-                ProcessInner::Remote(channel)
-            }
-        };
-        Ok(Box::new(Process {
-            computer: self,
-            stdout_buffer: Default::default(),
-            stderr_buffer: Default::default(),
-            inner,
-        }))
+        Process::new(self, command)
     }
 }
 
@@ -323,9 +275,8 @@ impl fmt::Debug for Computer {
 }
 
 impl Drop for Computer {
-    /// Scrub the password on the way out.
     fn drop(&mut self) {
-        self.delete_auth();
+        self.delete_auth(); // Scrub the password on the way out.
     }
 }
 
@@ -349,19 +300,68 @@ enum ProcessInner {
     Remote(Channel),
 }
 
-impl fmt::Debug for ProcessInner {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Local(child) => fmt.debug_tuple("Local").field(child).finish(),
-            Self::Remote(_channel) => fmt
-                .debug_tuple("Remote")
-                .field(&format_args!("ssh2::Channel"))
-                .finish(),
+impl Process {
+    /// Argument command is the program path followed by its arguments.
+    pub fn new(
+        computer: Arc<Computer>,
+        command: &[impl AsRef<str>],
+    ) -> Result<Box<Process>, Error> {
+        assert!(!command.is_empty());
+        let inner = match computer.as_ref() {
+            Computer::Local => {
+                // Setup the subprocess command.
+                let mut cmd = Command::new(command[0].as_ref());
+                cmd.args(command[1..].iter().map(|arg| arg.as_ref()));
+                cmd.stdin(Stdio::piped());
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
+                ProcessInner::Local(cmd.spawn()?)
+            }
+            Computer::Remote { sess, .. } => {
+                // Assemble the command into a single line.
+                let mut line = String::with_capacity(
+                    command.iter().map(|arg| arg.as_ref().len()).sum::<usize>() + command.len() - 1,
+                );
+                line.push_str(command[0].as_ref());
+                for arg in &command[1..] {
+                    line.push(' ');
+                    line.push_str(arg.as_ref());
+                }
+                // Run the program on the remote computer.
+                let sess = sess.as_ref().expect("Session not established");
+                sess.set_blocking(true);
+                let mut channel = sess.channel_session()?;
+                channel.exec(&line)?;
+                //
+                ProcessInner::Remote(channel)
+            }
+        };
+        let mut this = Process {
+            computer,
+            stdout_buffer: Default::default(),
+            stderr_buffer: Default::default(),
+            inner,
+        };
+        this.set_blocking(false);
+        Ok(Box::new(this))
+    }
+    fn set_blocking(&mut self, blocking: bool) {
+        if let ProcessInner::Local(child) = &self.inner {
+            #[cfg(target_family = "unix")]
+            {
+                change_blocking_fd(child.stdout.as_ref().unwrap().as_raw_fd(), blocking);
+                change_blocking_fd(child.stderr.as_ref().unwrap().as_raw_fd(), blocking);
+            }
+            #[cfg(target_family = "windows")]
+            {
+                todo!()
+            }
+        } else if let Some(sess) = self.computer.get_session() {
+            sess.set_blocking(blocking);
+        } else {
+            unreachable!();
         }
     }
-}
-
-impl Process {
     /// Is this process still running or does it have unread messages on stdout or stderr?
     pub fn is_alive(&mut self) -> Result<bool, Error> {
         dbg!(&self);
@@ -371,12 +371,12 @@ impl Process {
             stderr_buffer,
             ..
         } = self;
+        // Check for buffered & uncollected data.
+        if !stdout_buffer.is_empty() || !stderr_buffer.is_empty() {
+            return Ok(true);
+        }
         match inner {
             ProcessInner::Local(child) => {
-                // Check for buffered & uncollected data.
-                if !stdout_buffer.is_empty() || !stderr_buffer.is_empty() {
-                    return Ok(true);
-                }
                 // Check for normal exit status code.
                 let status = child.try_wait()?;
                 if status.is_none() {
@@ -446,6 +446,9 @@ impl Process {
     /// Write to and flush the process’s standard input channel.
     /// This appends a newline (if not already present).
     pub fn send_line(&mut self, message: &str) -> Result<(), Error> {
+        if let Some(sess) = self.computer.get_session() {
+            sess.set_blocking(true);
+        }
         let stdin = self.stdin()?;
         stdin.write_all(message.as_bytes())?;
         if !message.ends_with('\n') {
@@ -456,6 +459,9 @@ impl Process {
     }
     /// Write to and flush the process’s standard input channel.
     pub fn send_bytes(&mut self, message: &[u8]) -> Result<(), Error> {
+        if let Some(sess) = self.computer.get_session() {
+            sess.set_blocking(true);
+        }
         let stdin = self.stdin()?;
         stdin.write_all(message)?;
         stdin.flush()?;
@@ -471,6 +477,7 @@ impl Process {
             return Ok(line);
         }
         //
+        self.set_blocking(false);
         let stdout = self.stdout()?;
         let read_result = read_nonblocking(stdout);
         //
@@ -499,6 +506,7 @@ impl Process {
             return Ok(Some(self.stdout_buffer.drain(..bytes).collect()));
         }
         //
+        self.set_blocking(false);
         let stdout = self.stdout()?;
         let chunk = read_nonblocking(stdout)?;
         self.stdout_buffer.append(&mut chunk.into());
@@ -511,24 +519,63 @@ impl Process {
     /// Read one line from the process’s standard output channel, blocking until
     /// it arrives. This removes the trailing newline.
     pub fn block_line(&mut self) -> Result<String, Error> {
-        loop {
-            if let Some(data) = self.recv_line()? {
-                return Ok(data);
-            } else {
-                std::thread::yield_now();
-            }
+        // First check the local buffer.
+        if let Some(line) = read_line(&mut self.stdout_buffer)? {
+            return Ok(line);
         }
+        //
+        self.set_blocking(true);
+        let mut stdout_buffer = std::mem::take(&mut self.stdout_buffer);
+        let stdout = self.stdout()?;
+        let retval = loop {
+            match read_nonblocking(stdout) {
+                Ok(data) => {
+                    stdout_buffer.append(&mut data.into());
+                    match read_line(&mut stdout_buffer) {
+                        Err(error) => break Err(error),
+                        Ok(result) => {
+                            if let Some(line) = result {
+                                break Ok(line);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let eof = err.kind() == ErrorKind::BrokenPipe;
+                    if eof && !stdout_buffer.is_empty() {
+                        let data = std::mem::take(&mut stdout_buffer);
+                        break String::from_utf8(data.into()).map_err(|error| error.into());
+                    }
+                    break Err(err.into());
+                }
+            }
+        };
+        self.stdout_buffer = stdout_buffer;
+        retval
     }
     /// Read an exact number of bytes from the process’s standard output
     /// channel, blocking until the data arrives.
     pub fn block_bytes(&mut self, bytes: usize) -> Result<Box<[u8]>, Error> {
-        loop {
-            if let Some(data) = self.recv_bytes(bytes)? {
-                return Ok(data);
-            } else {
-                std::thread::yield_now();
-            }
+        // First check the local buffer.
+        if self.stdout_buffer.len() >= bytes {
+            return Ok(self.stdout_buffer.drain(..bytes).collect());
         }
+        self.set_blocking(true);
+        let mut stdout_buffer = std::mem::take(&mut self.stdout_buffer);
+        let stdout = self.stdout()?;
+        let retval = loop {
+            match read_nonblocking(stdout) {
+                Err(error) => break Err(error.into()),
+                Ok(chunk) => {
+                    stdout_buffer.append(&mut chunk.into());
+                    if stdout_buffer.len() >= bytes {
+                        break Ok(stdout_buffer.drain(..bytes).collect());
+                    }
+                }
+            }
+        };
+        self.stdout_buffer = stdout_buffer;
+        retval
     }
     /// Read one line from the process’s standard error channel.
     pub fn error_line(&mut self) -> Result<Option<String>, Error> {
@@ -538,6 +585,7 @@ impl Process {
             return Ok(line);
         }
         //
+        self.set_blocking(false);
         let read_result = match &mut self.inner {
             ProcessInner::Local(child) => read_nonblocking(child.stderr.as_mut().unwrap()),
             ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr()),
@@ -562,6 +610,7 @@ impl Process {
     }
     /// Read all available bytes from the process’s standard error channel.
     pub fn error_bytes(&mut self) -> Result<Vec<u8>, Error> {
+        self.set_blocking(false);
         let read_result = match &mut self.inner {
             ProcessInner::Local(child) => read_nonblocking(child.stderr.as_mut().unwrap()),
             ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr()),
@@ -593,8 +642,7 @@ impl Process {
                 // Block so that it can flush the buffer.
                 let sess = self.computer.get_session().unwrap();
                 sess.set_blocking(true);
-                channel.close()?;
-                sess.set_blocking(false);
+                channel.send_eof()?;
             }
         }
         Ok(())
@@ -617,8 +665,8 @@ impl Process {
                 let sess = self.computer.get_session().unwrap();
                 sess.set_blocking(true);
                 channel.close()?;
+                channel.wait_eof()?; // required to complete before calling wait_close
                 channel.wait_close()?;
-                sess.set_blocking(false);
                 //
                 let signal = channel.exit_signal()?;
                 if signal.exit_signal.is_some() {
@@ -636,6 +684,18 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         let _error = self.close_stdin();
+    }
+}
+
+impl fmt::Debug for ProcessInner {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(child) => fmt.debug_tuple("Local").field(child).finish(),
+            Self::Remote(_channel) => fmt
+                .debug_tuple("Remote")
+                .field(&format_args!("ssh2::Channel"))
+                .finish(),
+        }
     }
 }
 
@@ -661,11 +721,12 @@ fn change_blocking_fd(fd: std::os::unix::io::RawFd, blocking: bool) {
     }
 }
 
+#[allow(clippy::uninit_vec)]
 fn read_nonblocking(pipe: &mut dyn Read) -> std::io::Result<Vec<u8>> {
     let mut len = 0;
     let mut buffer = vec![];
     loop {
-        buffer.reserve(100);
+        buffer.reserve(1024);
         unsafe {
             buffer.set_len(buffer.capacity());
         }
@@ -819,16 +880,23 @@ mod tests {
 
         // No data yet, should instantly yield (non-blocking).
         assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
+        assert!(proc.is_alive().unwrap());
 
         // Send a message. Environment should echo it back to stdout.
         proc.send_line("Hello remote").unwrap();
+        assert!(proc.is_alive().unwrap());
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "Hello remote");
+        assert!(proc.is_alive().unwrap());
 
         // Message consumed, no further messages.
         assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
+        assert!(proc.is_alive().unwrap());
 
         assert!(proc.error_bytes().unwrap().is_empty());
+        assert!(proc.is_alive().unwrap());
+        proc.close_stdin().unwrap();
+        assert!(proc.is_alive().unwrap());
         assert!(proc.wait().unwrap());
         assert!(!proc.is_alive().unwrap());
     }
@@ -872,13 +940,16 @@ mod tests {
         let mut proc = Arc::new(Computer::Local)
             .exec(&["python", "-c", PROG])
             .unwrap();
+        // Check non-blocking before results are ready.
         assert!(dbg!(proc.error_bytes()).unwrap().is_empty());
         assert!(dbg!(proc.recv_line().unwrap()).is_none());
         assert!(dbg!(proc.recv_bytes(6).unwrap()).is_none());
-        //
+        // Wait for results.
         assert_eq!(proc.block_line().unwrap(), "hello");
         assert_eq!(proc.block_bytes(6).unwrap(), (*b"world!").into());
         assert!(!dbg!(proc.error_bytes()).unwrap().is_empty()); // div zero error
+        assert!(dbg!(proc.recv_line().unwrap()).is_none()); // non-blocking still works
+        assert!(dbg!(proc.recv_bytes(1).unwrap()).is_none());
         assert!(!proc.wait().unwrap()); // error code at exit
     }
 }
